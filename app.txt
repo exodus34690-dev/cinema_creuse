@@ -1,0 +1,187 @@
+import pandas as pd
+import numpy as np
+import re
+import Levenshtein
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.compose import ColumnTransformer
+from sklearn.neighbors import NearestNeighbors
+df = pd.read_csv('Final_FilmsCreuse_Database.csv', sep=';')
+
+# On remplace les virgules par des espaces pour le Genre
+df['Genre_Clean'] = df['Genre'].fillna('').str.replace(',', ' ')
+df['Resume_Clean'] = df['Resume'].fillna('')
+
+# pour les noms : on supprime les espaces
+# on remplace les virgules séparatrices par des espaces
+df['Real_Clean'] = df['Realisateurs'].fillna('').str.replace(' ', '').str.replace(',', ' ')
+df['Casting_Clean'] = df['Casting'].fillna('').str.replace(' ', '').str.replace(',', ' ')
+
+
+preprocesseur = ColumnTransformer(
+    transformers=[
+        # Les chiffres
+        ('poids_note', StandardScaler(), ['Note']),
+        ('poids_annee', StandardScaler(), ['Annee_Sortie']),
+        ('poids_duree', StandardScaler(), ['Duree']), #on prend la note, la durée, l'année de sortie et on les met sur la même échelle
+
+        # La catégorie stricte
+        ('langue', OneHotEncoder(handle_unknown='ignore'), ['Langue_VO']), #transforme la langue en cases Oui/Non (1 ou 0)
+
+        # Les 4 analyses de texte séparées
+        ('tfidf_genre', TfidfVectorizer(stop_words='english'), 'Genre_Clean'),
+        ('tfidf_resume', TfidfVectorizer(stop_words='english'), 'Resume_Clean'), #jette les mots inutiles
+        # Pas de stop_words pour les noms propres :
+        ('tfidf_real', TfidfVectorizer(), 'Real_Clean'),
+        ('tfidf_casting', TfidfVectorizer(), 'Casting_Clean')
+    ],
+    remainder='drop',
+
+
+    transformer_weights={
+        'poids_note': 0.3,
+        'poids_annee': 0.2,
+        'poids_duree': 0.0,
+
+        'langue': 0.5,
+        'tfidf_genre': 2.1,
+        'tfidf_resume': 2.1,
+        'tfidf_real': 1.2,
+        'tfidf_casting': 1.1
+    }
+)
+
+pipeline_reco = Pipeline(steps=[
+    ('nettoyage', preprocesseur),
+    ('algorithme_knn', NearestNeighbors(n_neighbors=40, metric='cosine'))
+])
+pipeline_reco.fit(df)
+
+
+#reco
+def recommande_interactif(titre_film, n_resultats=5):
+    titre_cherche = str(titre_film).lower()
+    titres_base = df['Titre_VF'].dropna().str.lower().tolist()
+
+    #vérifie si le titre tapé existe exactement tel quel
+    if titre_cherche in titres_base:
+        titre_trouve = titre_cherche
+    else:
+        # S'il n'existe pas, on cherche les 5 meilleures propositions
+        candidats = []
+        for titre in titres_base:
+
+            #Si l'orthographe est parfaite
+            if titre_cherche in titre:
+                candidats.append((titre, 1.0))
+                continue
+
+            #Si faute de frappe + Titre long
+            meilleur_sous_score = 0.0
+            longueur_cherche = len(titre_cherche)
+            longueur_titre = len(titre)
+
+            # Si le texte tapé est plus grand ou égal au titre, on fait un calcul normal
+            if longueur_cherche >= longueur_titre:
+                meilleur_sous_score = Levenshtein.ratio(titre_cherche, titre)
+            else:
+                # Sinon, on fait glisser notre "fenêtre" sur le titre
+                for i in range(longueur_titre - longueur_cherche + 1):
+                    morceau_titre = titre[i:i+longueur_cherche]
+                    score = Levenshtein.ratio(titre_cherche, morceau_titre)
+                    if score > meilleur_sous_score:
+                        meilleur_sous_score = score
+
+            # On garde si ça ressemble à au moins 75%
+            if meilleur_sous_score >= 0.75:
+                candidats.append((titre, meilleur_sous_score))
+
+        # On trie du meilleur score au moins bon, et on garde les 5 premiers
+        candidats = sorted(candidats, key=lambda x: x[1], reverse=True)
+        candidats_uniques = []
+        titres_vus = set()
+        for titre, score in candidats:
+            if titre not in titres_vus: # Si on n'a jamais vu ce titre
+                candidats_uniques.append((titre, score)) # On l'ajoute à la liste finale
+                titres_vus.add(titre) # Et on le note dans le carnet pour ne plus l'accepter
+
+        # On remplace l'ancienne liste par la nouvelle, en gardant les 5 premiers
+        candidats = candidats_uniques[:5]
+
+        #le menu interactif
+        print(f"Le film '{titre_film}' est introuvable. Vouliez-vous dire :")
+        for i, (titre, score) in enumerate(candidats):
+            print(f"   {i+1}. {titre.title()} (Ressemblance : {score*100:.1f}%)")
+        print("   0. Annuler la recherche\n")
+
+        choix = input("Entrez le numéro de votre choix (0 à 5) : ")
+
+        if not choix.isdigit() or int(choix) == 0 or int(choix) > len(candidats):
+            print("Recherche annulée.")
+            return
+
+        # On récupère le titre choisi
+        index_choix = int(choix) - 1
+        titre_trouve = candidats[index_choix][0]
+        print(f"\n Lancement de la recherche pour '{titre_trouve.title()}'...\n")
+
+
+    idx = df[df['Titre_VF'].str.lower() == titre_trouve].index[0]
+    film_reference = df.iloc[[idx]]
+    vrai_titre = film_reference['Titre_VF'].values[0]
+
+    genres_film_cherche = set(str(film_reference['Genre'].values[0]).split(','))
+
+    vecteur_film = pipeline_reco.named_steps['nettoyage'].transform(film_reference)
+    distances, indices = pipeline_reco.named_steps['algorithme_knn'].kneighbors(vecteur_film)
+
+    films_candidats = []
+
+    for i in range(1, len(distances[0])):
+        film_idx = indices[0][i]
+
+        genres_candidat = set(str(df.iloc[film_idx]['Genre']).split(','))
+        genres_en_commun = genres_film_cherche.intersection(genres_candidat)
+
+        if 'Animation' in genres_film_cherche and 'Animation' not in genres_candidat:
+            continue
+        if 'Animation' not in genres_film_cherche and 'Animation' in genres_candidat:
+            continue
+
+        genres_forts = ['Sci-Fi', 'Horror', 'Romance', 'Western', 'Documentary']
+        rejet_genre_fort = False
+        for genre_fort in genres_forts:
+            if genre_fort in genres_film_cherche and genre_fort not in genres_candidat:
+                rejet_genre_fort = True
+                break
+
+        if rejet_genre_fort:
+            continue
+
+        if len(genres_en_commun) == 0:
+            continue
+
+        score = (1 - distances[0][i]) * 100
+
+        films_candidats.append({
+            'Titre': df.iloc[film_idx]['Titre_VF'],
+            'Annee': df.iloc[film_idx]['Annee_Sortie'],
+            'Note': df.iloc[film_idx]['Note'],
+            'Genre': df.iloc[film_idx]['Genre'],
+            'Real': df.iloc[film_idx]['Realisateurs'],
+            'Score_Global': score
+        })
+
+    films_tries = sorted(films_candidats, key=lambda x: x['Score_Global'], reverse=True)
+
+    print(f"Parce que vous avez aimé '{vrai_titre}' :")
+    print("-" * 70)
+
+    nb_a_afficher = min(n_resultats, len(films_tries))
+    for i in range(nb_a_afficher):
+        film = films_tries[i]
+        print(f"{i+1}. {film['Titre']} ({film['Annee']}) - Note : {film['Note']}/10")
+        print(f"   ↳ Match Global : {film['Score_Global']:.1f} pts | Réal: {film['Real']}")
+        print(f"   ↳ Genre: {film['Genre']}\n")
